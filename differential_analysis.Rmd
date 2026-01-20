@@ -1,0 +1,744 @@
+---
+title: "Differential Analysis of Single Cell Data"
+subtitle: "Using diffcyt and cytoGLMM"
+author: "ark-analysis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = "center"
+)
+```
+
+# Introduction
+
+This notebook performs differential analysis of single cell data from the ark-analysis pipeline using:
+
+1. **diffcyt** - For differential abundance (DA) and differential state (DS) analysis
+2. **cytoGLMM** - For generalized linear mixed models with bootstrap inference
+
+**Input:** `cell_table_size_normalized_cell_labels.csv` from ark-analysis
+
+**Output:** Statistical results and visualizations for differential testing
+
+---
+
+# 1. Setup
+
+## 1.1 Install and Load Packages
+
+```{r install-packages, message=FALSE}
+# Install packages if needed
+install_if_missing <- function(packages, bioc = FALSE) {
+  for (pkg in packages) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      if (bioc) {
+        if (!requireNamespace("BiocManager", quietly = TRUE)) {
+          install.packages("BiocManager")
+        }
+        BiocManager::install(pkg, update = FALSE, ask = FALSE)
+      } else {
+        install.packages(pkg)
+      }
+    }
+  }
+}
+
+# CRAN packages
+cran_packages <- c("tidyverse", "ggplot2", "pheatmap", "RColorBrewer",
+                   "viridis", "ggrepel", "DT", "knitr")
+install_if_missing(cran_packages)
+
+# Bioconductor packages
+bioc_packages <- c("diffcyt", "SummarizedExperiment", "CATALYST",
+                   "SingleCellExperiment", "edgeR", "limma")
+install_if_missing(bioc_packages, bioc = TRUE)
+
+# cytoGLMM
+if (!requireNamespace("cytoGLMM", quietly = TRUE)) {
+  tryCatch(
+    install.packages("cytoGLMM"),
+    error = function(e) {
+      if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+      remotes::install_github("christofseiler/cytoGLMM")
+    }
+  )
+}
+```
+
+```{r load-libraries, message=FALSE}
+library(tidyverse)
+library(diffcyt)
+library(SummarizedExperiment)
+library(SingleCellExperiment)
+library(CATALYST)
+library(edgeR)
+library(limma)
+library(cytoGLMM)
+library(pheatmap)
+library(RColorBrewer)
+library(viridis)
+library(ggrepel)
+library(DT)
+library(knitr)
+```
+
+## 1.2 Configuration
+
+Modify these parameters for your analysis:
+
+```{r configuration}
+# =============================================================================
+# USER CONFIGURATION
+# =============================================================================
+
+# Path to cell table from ark-analysis
+CELL_TABLE_PATH <- "path/to/cell_table_size_normalized_cell_labels.csv"
+
+# Path to sample metadata (optional - will be created if NULL)
+# Should have columns: sample_id, condition, patient_id
+METADATA_PATH <- NULL
+
+# Output directory for results
+OUTPUT_DIR <- "./differential_analysis_results"
+
+# Column names in the cell table
+FOV_COL <- "fov"                        # Sample/FOV identifier
+CLUSTER_COL <- "cell_meta_cluster"      # Cell type/cluster column
+PATIENT_COL <- "PatientID"              # Patient identifier (optional)
+CONDITION_COL <- "condition"            # Condition/treatment column
+
+# Analysis parameters
+FDR_THRESHOLD <- 0.05                   # False discovery rate threshold
+COFACTOR <- 5                           # Arcsinh transformation cofactor
+
+# Marker specification (NULL = auto-detect)
+MARKER_COLS <- NULL                     # e.g., c("CD3", "CD4", "CD8", "CD45")
+STATE_MARKERS <- NULL                   # Markers for differential state testing
+TYPE_MARKERS <- NULL                    # Markers used for cell typing
+
+# Create output directory
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+```
+
+---
+
+# 2. Load and Explore Data
+
+## 2.1 Load Cell Table
+
+```{r load-data}
+# Load the cell table
+message("Loading cell data...")
+cell_data <- read_csv(CELL_TABLE_PATH, show_col_types = FALSE)
+
+cat("Dataset dimensions:", nrow(cell_data), "cells x", ncol(cell_data), "columns\n")
+```
+
+```{r preview-data}
+# Preview the data
+head(cell_data, 10) %>%
+  datatable(options = list(scrollX = TRUE, pageLength = 5))
+```
+
+## 2.2 Detect Marker Columns
+
+```{r detect-markers}
+# Function to detect marker columns (between cell_size and label)
+detect_marker_columns <- function(df) {
+  col_names <- colnames(df)
+
+  pre_col <- which(col_names == "cell_size")
+  post_col <- which(col_names == "label")
+
+  if (length(pre_col) == 0 || length(post_col) == 0) {
+    # Fallback: exclude known metadata
+    metadata_cols <- c("cell_size", "label", "fov", "area", "eccentricity",
+                       "major_axis_length", "minor_axis_length", "perimeter",
+                       "convex_area", "equivalent_diameter", "centroid-0",
+                       "centroid-1", "cell_meta_cluster", "cell_som_cluster",
+                       "PatientID", "mask_type", "major_minor_axis_ratio",
+                       "perim_square_over_area", "major_axis_equiv_diam_ratio",
+                       "convex_hull_resid", "centroid_dif", "num_concavities", "nc_ratio")
+
+    numeric_cols <- col_names[sapply(df, is.numeric)]
+    marker_cols <- setdiff(numeric_cols, metadata_cols)
+  } else {
+    marker_cols <- col_names[(pre_col + 1):(post_col - 1)]
+  }
+
+  return(marker_cols)
+}
+
+# Detect or use specified markers
+if (is.null(MARKER_COLS)) {
+  marker_cols <- detect_marker_columns(cell_data)
+} else {
+  marker_cols <- MARKER_COLS
+}
+
+cat("Detected", length(marker_cols), "marker columns:\n")
+print(marker_cols)
+```
+
+## 2.3 Explore Cell Types
+
+```{r explore-cell-types}
+# Cell type distribution
+cell_type_counts <- cell_data %>%
+  count(!!sym(CLUSTER_COL), name = "n_cells") %>%
+  arrange(desc(n_cells)) %>%
+  mutate(percentage = round(n_cells / sum(n_cells) * 100, 1))
+
+kable(cell_type_counts, caption = "Cell Type Distribution")
+```
+
+```{r cell-type-barplot, fig.height=5}
+ggplot(cell_type_counts, aes(x = reorder(!!sym(CLUSTER_COL), n_cells), y = n_cells)) +
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.8) +
+  geom_text(aes(label = paste0(percentage, "%")), hjust = -0.1, size = 3) +
+  coord_flip() +
+  labs(title = "Cell Type Distribution",
+       x = "Cell Type", y = "Number of Cells") +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = 9))
+```
+
+## 2.4 Sample Overview
+
+```{r sample-overview}
+# Samples per condition
+sample_summary <- cell_data %>%
+  group_by(!!sym(FOV_COL)) %>%
+  summarise(
+    n_cells = n(),
+    n_cell_types = n_distinct(!!sym(CLUSTER_COL)),
+    .groups = "drop"
+  )
+
+kable(sample_summary, caption = "Sample Summary")
+```
+
+---
+
+# 3. Prepare Sample Metadata
+
+```{r prepare-metadata}
+# Load or create sample metadata
+if (!is.null(METADATA_PATH) && file.exists(METADATA_PATH)) {
+  message("Loading sample metadata from file...")
+  sample_metadata <- read_csv(METADATA_PATH, show_col_types = FALSE)
+} else {
+  message("Creating sample metadata from cell data...")
+
+  samples <- unique(cell_data[[FOV_COL]])
+
+  sample_metadata <- data.frame(
+    sample_id = samples,
+    stringsAsFactors = FALSE
+  )
+
+  # Add patient ID if available
+  if (PATIENT_COL %in% colnames(cell_data)) {
+    patient_map <- cell_data %>%
+      select(all_of(c(FOV_COL, PATIENT_COL))) %>%
+      distinct() %>%
+      rename(sample_id = !!FOV_COL, patient_id = !!PATIENT_COL)
+    sample_metadata <- left_join(sample_metadata, patient_map, by = "sample_id")
+  } else {
+    sample_metadata$patient_id <- sample_metadata$sample_id
+  }
+
+  # Add condition if available
+  if (CONDITION_COL %in% colnames(cell_data)) {
+    condition_map <- cell_data %>%
+      select(all_of(c(FOV_COL, CONDITION_COL))) %>%
+      distinct() %>%
+      rename(sample_id = !!FOV_COL, condition = !!CONDITION_COL)
+    sample_metadata <- left_join(sample_metadata, condition_map, by = "sample_id")
+  } else {
+    # Create dummy conditions for demonstration
+    sample_metadata$condition <- rep(c("Control", "Treatment"),
+                                     length.out = nrow(sample_metadata))
+    message("NOTE: No condition column found. Created dummy conditions.")
+  }
+}
+
+kable(sample_metadata, caption = "Sample Metadata")
+```
+
+```{r metadata-summary}
+# Summary of experimental design
+cat("Experimental Design Summary:\n")
+cat("  Total samples:", nrow(sample_metadata), "\n")
+cat("  Conditions:", paste(unique(sample_metadata$condition), collapse = ", "), "\n")
+cat("  Patients:", length(unique(sample_metadata$patient_id)), "\n")
+```
+
+---
+
+# 4. diffcyt Analysis
+
+## 4.1 Prepare Data for diffcyt
+
+```{r prepare-diffcyt}
+# Split cell data by sample
+sample_ids <- unique(sample_metadata$sample_id)
+
+d_input <- lapply(sample_ids, function(sid) {
+  sample_cells <- cell_data %>%
+    filter(!!sym(FOV_COL) == sid) %>%
+    select(all_of(marker_cols))
+  as.matrix(sample_cells)
+})
+names(d_input) <- sample_ids
+
+# Create experiment info
+experiment_info <- sample_metadata %>%
+  mutate(
+    sample_id = factor(sample_id),
+    group_id = factor(condition),
+    patient_id = factor(patient_id)
+  ) %>%
+  select(sample_id, group_id, patient_id) %>%
+  as.data.frame()
+
+# Create marker info
+marker_info <- data.frame(
+  channel_name = marker_cols,
+  marker_name = marker_cols,
+  marker_class = ifelse(is.null(STATE_MARKERS) | marker_cols %in% STATE_MARKERS,
+                        "state", "type"),
+  stringsAsFactors = FALSE
+)
+
+cat("Prepared data for", length(d_input), "samples\n")
+cat("Markers classified as 'state':", sum(marker_info$marker_class == "state"), "\n")
+cat("Markers classified as 'type':", sum(marker_info$marker_class == "type"), "\n")
+```
+
+```{r prepare-se}
+# Create SummarizedExperiment
+d_se <- prepareData(
+  d_input = d_input,
+  experiment_info = experiment_info,
+  marker_info = marker_info
+)
+
+# Transform data (arcsinh)
+d_se <- transformData(d_se, cofactor = COFACTOR)
+
+cat("SummarizedExperiment created with", ncol(d_se), "cells\n")
+```
+
+## 4.2 Differential Abundance (DA) Analysis
+
+Tests whether cell type proportions differ between conditions.
+
+```{r diffcyt-clustering}
+# Generate clusters (or use existing cell type assignments)
+# Here we use FlowSOM clustering for demonstration
+d_se <- generateClusters(d_se, seed_clustering = 42)
+```
+
+```{r diffcyt-da}
+# Calculate cluster counts
+d_counts <- calcCounts(d_se)
+
+# Create design matrix
+design_matrix <- createDesignMatrix(
+  experiment_info,
+  cols_design = "group_id"
+)
+
+# Create contrast (Treatment vs Control)
+contrast <- createContrast(c(0, 1))
+
+cat("Design matrix:\n")
+print(design_matrix)
+cat("\nContrast:\n")
+print(contrast)
+```
+
+```{r run-da}
+# Run DA test using edgeR
+res_DA <- testDA_edgeR(
+  d_counts = d_counts,
+  design = design_matrix,
+  contrast = contrast
+)
+
+# Extract results
+results_DA <- rowData(res_DA) %>%
+  as.data.frame() %>%
+  arrange(p_adj) %>%
+  mutate(significant = p_adj < FDR_THRESHOLD)
+
+cat("\nDifferential Abundance Results:\n")
+cat("  Total clusters tested:", nrow(results_DA), "\n")
+cat("  Significant (FDR <", FDR_THRESHOLD, "):", sum(results_DA$significant), "\n")
+```
+
+```{r da-results-table}
+# Display results
+results_DA %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  datatable(options = list(scrollX = TRUE, pageLength = 10),
+            caption = "Differential Abundance Results")
+```
+
+```{r da-volcano, fig.height=6}
+# Volcano plot
+ggplot(results_DA, aes(x = logFC, y = -log10(p_adj))) +
+  geom_point(aes(color = significant), size = 3, alpha = 0.7) +
+  geom_hline(yintercept = -log10(FDR_THRESHOLD), linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("FALSE" = "gray60", "TRUE" = "red3"),
+                     labels = c("Not Significant", "Significant")) +
+  geom_text_repel(
+    data = filter(results_DA, significant),
+    aes(label = cluster_id),
+    size = 3, max.overlaps = 20
+  ) +
+  labs(
+    title = "Differential Abundance Analysis",
+    subtitle = paste("Treatment vs Control | FDR <", FDR_THRESHOLD),
+    x = "Log2 Fold Change",
+    y = "-log10(Adjusted P-value)",
+    color = ""
+  ) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+```{r save-da}
+# Save DA results
+write_csv(results_DA, file.path(OUTPUT_DIR, "diffcyt_DA_results.csv"))
+message("Saved: diffcyt_DA_results.csv")
+```
+
+## 4.3 Differential State (DS) Analysis
+
+Tests whether marker expression differs between conditions within cell types.
+
+```{r diffcyt-ds}
+# Calculate median marker expression per cluster per sample
+d_medians <- calcMedians(d_se)
+
+# Run DS test using limma
+res_DS <- testDS_limma(
+  d_counts = d_counts,
+  d_medians = d_medians,
+  design = design_matrix,
+  contrast = contrast
+)
+
+# Extract results
+results_DS <- rowData(res_DS) %>%
+  as.data.frame() %>%
+  arrange(p_adj) %>%
+  mutate(significant = p_adj < FDR_THRESHOLD)
+
+cat("\nDifferential State Results:\n")
+cat("  Total marker-cluster combinations:", nrow(results_DS), "\n")
+cat("  Significant (FDR <", FDR_THRESHOLD, "):", sum(results_DS$significant), "\n")
+```
+
+```{r ds-results-table}
+# Display results
+results_DS %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  datatable(options = list(scrollX = TRUE, pageLength = 10),
+            caption = "Differential State Results")
+```
+
+```{r ds-heatmap, fig.height=8}
+# Heatmap of significant results
+if (any(results_DS$significant)) {
+  sig_DS <- results_DS %>% filter(significant)
+
+  if (nrow(sig_DS) > 1 && "marker_id" %in% colnames(sig_DS)) {
+    heatmap_data <- sig_DS %>%
+      select(cluster_id, marker_id, logFC) %>%
+      pivot_wider(names_from = marker_id, values_from = logFC, values_fill = 0) %>%
+      column_to_rownames("cluster_id") %>%
+      as.matrix()
+
+    if (ncol(heatmap_data) > 1 && nrow(heatmap_data) > 1) {
+      pheatmap(
+        heatmap_data,
+        main = "Differential State: Log2 Fold Changes\n(Significant Results)",
+        color = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+        cluster_rows = nrow(heatmap_data) > 2,
+        cluster_cols = ncol(heatmap_data) > 2,
+        fontsize = 10,
+        angle_col = 45
+      )
+    }
+  }
+} else {
+  message("No significant DS results to display")
+}
+```
+
+```{r save-ds}
+# Save DS results
+write_csv(results_DS, file.path(OUTPUT_DIR, "diffcyt_DS_results.csv"))
+message("Saved: diffcyt_DS_results.csv")
+```
+
+---
+
+# 5. cytoGLMM Analysis
+
+cytoGLMM uses generalized linear mixed models with bootstrap inference, which properly accounts for the hierarchical structure of the data (cells nested within patients/samples).
+
+## 5.1 Prepare Data for cytoGLMM
+
+```{r prepare-cytoglmm}
+# Merge cell data with metadata
+cyto_data <- cell_data %>%
+  left_join(
+    sample_metadata %>% select(sample_id, condition, patient_id),
+    by = setNames("sample_id", FOV_COL)
+  ) %>%
+  rename(
+    donor = patient_id,
+    group = condition
+  ) %>%
+  select(donor, group, all_of(marker_cols)) %>%
+  mutate(
+    donor = as.factor(donor),
+    group = as.factor(group)
+  ) %>%
+  drop_na()
+
+cat("Prepared", nrow(cyto_data), "cells for cytoGLMM\n")
+cat("Donors:", length(unique(cyto_data$donor)), "\n")
+cat("Groups:", paste(unique(cyto_data$group), collapse = ", "), "\n")
+```
+
+## 5.2 Run cytoGLMM (cytoglm)
+
+```{r run-cytoglm, message=TRUE}
+# Run cytoglm - cell-level GLM with donor as random effect
+message("Running cytoGLMM (cytoglm)...")
+message("This may take several minutes depending on data size...")
+
+tryCatch({
+  glm_fit <- cytoglm(
+    cyto_data = cyto_data,
+    protein_names = marker_cols,
+    condition = "group",
+    group = "donor",
+    num_boot = 100  # Increase for more stable p-values (e.g., 500-1000)
+  )
+
+  # Extract results
+  results_glm <- summary(glm_fit) %>%
+    arrange(p_adj) %>%
+    mutate(significant = p_adj < FDR_THRESHOLD)
+
+  cat("\ncytoGLMM (cytoglm) Results:\n")
+  cat("  Markers tested:", length(marker_cols), "\n")
+  cat("  Significant (FDR <", FDR_THRESHOLD, "):", sum(results_glm$significant), "\n")
+
+}, error = function(e) {
+  message("Error running cytoglm: ", e$message)
+  results_glm <<- NULL
+})
+```
+
+```{r glm-results}
+if (exists("results_glm") && !is.null(results_glm)) {
+  results_glm %>%
+    mutate(across(where(is.numeric), ~round(., 4))) %>%
+    datatable(options = list(scrollX = TRUE, pageLength = 15),
+              caption = "cytoGLMM Results")
+}
+```
+
+```{r glm-volcano, fig.height=6}
+if (exists("results_glm") && !is.null(results_glm) && nrow(results_glm) > 0) {
+  ggplot(results_glm, aes(x = estimate, y = -log10(p_adj))) +
+    geom_point(aes(color = significant), size = 3, alpha = 0.7) +
+    geom_hline(yintercept = -log10(FDR_THRESHOLD), linetype = "dashed", color = "red") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    scale_color_manual(values = c("FALSE" = "gray60", "TRUE" = "steelblue"),
+                       labels = c("Not Significant", "Significant")) +
+    geom_text_repel(
+      data = filter(results_glm, significant),
+      aes(label = protein_name),
+      size = 3, max.overlaps = 15
+    ) +
+    labs(
+      title = "cytoGLMM Analysis",
+      subtitle = paste("Treatment vs Control | FDR <", FDR_THRESHOLD),
+      x = "Effect Size (Log Odds)",
+      y = "-log10(Adjusted P-value)",
+      color = ""
+    ) +
+    theme_bw() +
+    theme(legend.position = "bottom")
+}
+```
+
+## 5.3 Run cytoGLMM per Cell Type
+
+```{r cytoglm-per-celltype, message=TRUE}
+# Run analysis separately for each cell type
+message("Running cytoGLMM per cell type...")
+
+cell_types <- unique(cell_data[[CLUSTER_COL]])
+ct_results <- list()
+
+for (ct in cell_types) {
+  message("  Processing: ", ct)
+
+  ct_data <- cell_data %>%
+    filter(!!sym(CLUSTER_COL) == ct) %>%
+    left_join(
+      sample_metadata %>% select(sample_id, condition, patient_id),
+      by = setNames("sample_id", FOV_COL)
+    ) %>%
+    rename(donor = patient_id, group = condition) %>%
+    select(donor, group, all_of(marker_cols)) %>%
+    mutate(donor = as.factor(donor), group = as.factor(group)) %>%
+    drop_na()
+
+  # Skip if insufficient data
+  if (nrow(ct_data) < 50 || length(unique(ct_data$donor)) < 3) {
+    message("    Skipping (insufficient data)")
+    next
+  }
+
+  tryCatch({
+    fit <- cytoglm(
+      cyto_data = ct_data,
+      protein_names = marker_cols,
+      condition = "group",
+      group = "donor",
+      num_boot = 100
+    )
+
+    ct_results[[ct]] <- summary(fit) %>%
+      mutate(cell_type = ct)
+
+  }, error = function(e) {
+    message("    Error: ", e$message)
+  })
+}
+
+# Combine results
+if (length(ct_results) > 0) {
+  results_ct <- bind_rows(ct_results) %>%
+    arrange(p_adj) %>%
+    mutate(significant = p_adj < FDR_THRESHOLD)
+
+  cat("\nPer-Cell-Type Results:\n")
+  cat("  Cell types analyzed:", length(ct_results), "\n")
+  cat("  Total tests:", nrow(results_ct), "\n")
+  cat("  Significant:", sum(results_ct$significant), "\n")
+}
+```
+
+```{r ct-results-table}
+if (exists("results_ct") && nrow(results_ct) > 0) {
+  results_ct %>%
+    mutate(across(where(is.numeric), ~round(., 4))) %>%
+    datatable(options = list(scrollX = TRUE, pageLength = 15),
+              caption = "cytoGLMM Results by Cell Type")
+}
+```
+
+```{r ct-heatmap, fig.height=8}
+if (exists("results_ct") && any(results_ct$significant)) {
+  sig_ct <- results_ct %>%
+    filter(significant) %>%
+    select(cell_type, protein_name, estimate) %>%
+    pivot_wider(names_from = protein_name, values_from = estimate, values_fill = 0)
+
+  if (nrow(sig_ct) > 1 && ncol(sig_ct) > 2) {
+    heatmap_mat <- sig_ct %>%
+      column_to_rownames("cell_type") %>%
+      as.matrix()
+
+    pheatmap(
+      heatmap_mat,
+      main = "cytoGLMM: Effect Sizes by Cell Type\n(Significant Results)",
+      color = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+      cluster_rows = nrow(heatmap_mat) > 2,
+      cluster_cols = ncol(heatmap_mat) > 2,
+      fontsize = 10,
+      angle_col = 45
+    )
+  }
+}
+```
+
+```{r save-cytoglmm}
+# Save cytoGLMM results
+if (exists("results_glm") && !is.null(results_glm)) {
+  write_csv(results_glm, file.path(OUTPUT_DIR, "cytoGLMM_results.csv"))
+  message("Saved: cytoGLMM_results.csv")
+}
+
+if (exists("results_ct") && nrow(results_ct) > 0) {
+  write_csv(results_ct, file.path(OUTPUT_DIR, "cytoGLMM_per_celltype_results.csv"))
+  message("Saved: cytoGLMM_per_celltype_results.csv")
+}
+```
+
+---
+
+# 6. Summary
+
+```{r summary}
+cat("=" %>% rep(60) %>% paste(collapse = ""), "\n")
+cat("DIFFERENTIAL ANALYSIS SUMMARY\n")
+cat("=" %>% rep(60) %>% paste(collapse = ""), "\n\n")
+
+cat("Input data:\n")
+cat("  Total cells:", nrow(cell_data), "\n")
+cat("  Samples:", length(unique(cell_data[[FOV_COL]])), "\n")
+cat("  Markers:", length(marker_cols), "\n")
+cat("  Cell types:", length(unique(cell_data[[CLUSTER_COL]])), "\n\n")
+
+cat("diffcyt Results:\n")
+cat("  Differential Abundance:\n")
+cat("    Tested:", nrow(results_DA), "clusters\n")
+cat("    Significant:", sum(results_DA$significant), "\n")
+cat("  Differential State:\n")
+cat("    Tested:", nrow(results_DS), "marker-cluster pairs\n")
+cat("    Significant:", sum(results_DS$significant), "\n\n")
+
+if (exists("results_glm") && !is.null(results_glm)) {
+  cat("cytoGLMM Results:\n")
+  cat("  Tested:", nrow(results_glm), "markers\n")
+  cat("  Significant:", sum(results_glm$significant), "\n")
+}
+
+cat("\nOutput files saved to:", OUTPUT_DIR, "\n")
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
