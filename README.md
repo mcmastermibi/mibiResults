@@ -1,4 +1,4 @@
-single_cell_visualizer
+single_cell_visualizer.ipynd
 
 Notebook Structure
 
@@ -25,7 +25,7 @@ Key Features
 - Progress bars with tqdm for longer operations
 - Graceful handling of optional dependencies (UMAP)
 
-CPM_montage_creator
+CPM_montage_creator.ipynd
 
 Notebook Structure
 The notebook is organized into 11 sections:
@@ -49,3 +49,32 @@ Key Features
 - Custom legend support - define your own color-to-cell-type mapping
 - Subset montages - easily create montages from specific FOVs
 - Progress bars for loading images
+
+differential_analysis.Rmd
+
+Analysis Methods
+
+diffcyt Package
+1. Differential Abundance (DA) - Tests if cell type proportions differ between conditions using edgeR
+2. Differential State (DS) - Tests if marker expression differs within cell types using limma
+
+cytoGLMM Package
+1. cytoglm - Generalized linear models with bootstrap inference
+2. Per-cell-type analysis - Runs GLMM separately for each cell type
+
+Key Features
+- Auto-detects marker columns from ark-analysis cell table structure
+- Creates sample metadata automatically if not provided
+- Handles experimental design with patient/donor as random effects
+- Multiple testing correction with adjustable FDR threshold
+- Visualizations: Volcano plots, heatmaps, forest plots
+- Exports results as CSV files
+
+Required Sample Metadata Format
+If providing a metadata file, it should have these columns:
+
+sample_id	  condition	  patient_id
+fov0		    Control	    Patient1
+fov1		    Treatment	  Patient1
+fov2		    Control	    Patient2
+
