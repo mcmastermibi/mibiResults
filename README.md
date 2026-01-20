@@ -1,3 +1,32 @@
+cellpose_segmentation.ipynb
+
+Key Features
+- Same input format as DeepCell: Takes deepcell_input 2-channel TIFF files (nuclear + membrane)
+- ark-analysis compatible output: Saves _whole_cell.tiff and _nuclear.tiff masks
+- All CellPose parameters exposed: diameter, flow_threshold, cellprob_threshold, min_size, etc.
+- GPU support: Automatically uses GPU if available
+- Model options: cyto3 (recommended), cyto2, cyto, nuclei, or custom models
+- Separate nuclear segmentation: Optionally segments nuclei using dedicated nuclei model
+- Visualization: Test single images before batch processing
+
+Configurable Parameters:
+
+Parameter			Default	Description
+--model			cyto3		CellPose model (cyto3, cyto2, nuclei, or custom path)
+--diameter			auto		Cell diameter in pixels
+--flow_threshold		0.4		Flow error threshold (0-1)
+--cellprob_threshold		0.0		Cell probability threshold (-6 to 6)
+--min_size			15		Minimum cell size in pixels
+--no_gpu			-		Disable GPU
+--no_nuclei			-		Skip nuclear segmentation
+--augment			-		Enable test-time augmentation
+
+Workflow: 
+1. Optimize parameters in CellPose GUI locally
+2. Copy parameters to script
+3. Run batch segmentation
+4. Continue with ark-analysis pipeline.
+
 single_cell_visualizer.ipynd
 
 Notebook Structure
